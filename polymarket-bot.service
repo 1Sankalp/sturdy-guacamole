@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Arbitrage Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/polystuff
+Environment=PATH=/home/YOUR_USERNAME/polystuff/venv/bin
+ExecStart=/home/YOUR_USERNAME/polystuff/venv/bin/python -m src.ultimate_bot
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/YOUR_USERNAME/polystuff/bot.log
+StandardError=append:/home/YOUR_USERNAME/polystuff/bot-error.log
+
+[Install]
+WantedBy=multi-user.target
