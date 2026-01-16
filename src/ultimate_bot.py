@@ -283,27 +283,83 @@ class UltimateBot:
         ))
     
     def _fetch_markets(self):
-        """Fetch all active markets from Gamma API"""
+        """Fetch 15-minute crypto up/down markets using timestamp-based slugs"""
         try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"closed": "false", "limit": 200},
-                timeout=10,
-            )
-            data = resp.json()
+            import time
+            from datetime import datetime, timezone
+            
+            # Get current timestamp and calculate 15-minute windows
+            now = datetime.now(timezone.utc)
+            base_ts = int(now.timestamp())
+            window_15min = 15 * 60
+            current_window = (base_ts // window_15min) * window_15min
+            
+            # Supported cryptocurrencies
+            cryptos = ["btc", "eth", "sol", "xrp"]
+            gamma_markets = []
+            
+            # Check current and next few windows (0, +1, +2, +3)
+            for offset in range(0, 4):
+                ts = current_window + (offset * window_15min)
+                
+                for crypto in cryptos:
+                    slug = f"{crypto}-updown-15m-{ts}"
+                    try:
+                        resp = requests.get(
+                            f"https://gamma-api.polymarket.com/events?slug={slug}",
+                            timeout=5,
+                        )
+                        if resp.status_code == 200:
+                            events = resp.json()
+                            for event in events:
+                                markets = event.get("markets", [])
+                                for m in markets:
+                                    if m.get("acceptingOrders") and not m.get("closed"):
+                                        gamma_markets.append(m)
+                    except Exception:
+                        continue
+            
+            logger.info(f"Found {len(gamma_markets)} 15-min crypto markets")
             
             self.markets = []
-            for m in data:
+            for m in gamma_markets:
                 try:
+                    # Get prices from market data
                     prices = json.loads(m.get("outcomePrices", '["0.5", "0.5"]'))
-                    tokens = m.get("tokens", [])
-                    
                     if len(prices) < 2:
                         continue
                     
+                    condition_id = m.get("conditionId", "")
+                    if not condition_id:
+                        continue
+                    
+                    # Get token IDs from clobTokenIds (for 15-min markets)
+                    clob_token_ids = json.loads(m.get("clobTokenIds", "[]"))
+                    if len(clob_token_ids) < 2:
+                        # Try CLOB API fallback
+                        clob_resp = requests.get(
+                            f"https://clob.polymarket.com/markets/{condition_id}",
+                            timeout=5,
+                        )
+                        if clob_resp.status_code == 200:
+                            clob_data = clob_resp.json()
+                            tokens = clob_data.get("tokens", [])
+                        else:
+                            continue
+                    else:
+                        # Build tokens from clobTokenIds
+                        outcomes = json.loads(m.get("outcomes", '["Up", "Down"]'))
+                        tokens = [
+                            {"token_id": clob_token_ids[0], "outcome": outcomes[0], "price": float(prices[0])},
+                            {"token_id": clob_token_ids[1], "outcome": outcomes[1], "price": float(prices[1])},
+                        ]
+                    
+                    if len(tokens) < 2:
+                        continue
+                    
                     market = Market(
-                        id=m.get("id", ""),
-                        condition_id=m.get("conditionId", ""),
+                        id=m.get("id", condition_id),
+                        condition_id=condition_id,
                         question=m.get("question", ""),
                         yes_price=float(prices[0]),
                         no_price=float(prices[1]),
@@ -312,7 +368,8 @@ class UltimateBot:
                         liquidity=float(m.get("liquidityNum", 0)),
                     )
                     self.markets.append(market)
-                except:
+                    
+                except Exception:
                     continue
                     
         except Exception as e:
@@ -384,8 +441,8 @@ class UltimateBot:
     
     def _check_99c_snipe(self, market: Market) -> Optional[Opportunity]:
         """Check for 99¢ sniping opportunity"""
-        # Only consider high liquidity markets
-        if market.liquidity < 1000:
+        # Need valid tokens to trade
+        if len(market.tokens) < 2:
             return None
         
         if market.yes_price >= self.SNIPE_THRESHOLD:
@@ -543,27 +600,48 @@ class UltimateBot:
         """Execute single-side trade"""
         tokens = opp.market.tokens
         if len(tokens) < 2:
+            logger.error("   ❌ No tokens available for this market")
             return
         
         idx = 0 if opp.direction == "YES" else 1
         token_id = tokens[idx].get("token_id", "")
+        
+        if not token_id:
+            logger.error("   ❌ Token ID not found")
+            return
+        
         price = opp.market.yes_price if opp.direction == "YES" else opp.market.no_price
         
-        order = OrderArgs(
-            token_id=token_id,
-            side=BUY,
-            size=self.order_size,
-            price=price + 0.01,
-        )
-        signed = self.client.create_order(order)
-        result = self.client.post_order(signed, OrderType.FOK)
+        # Round price to 2 decimals, size to 2 decimals (Polymarket requirement)
+        # Price must be between 0.01 and 0.99
+        order_price = min(0.99, round(price + 0.01, 2))
+        order_size = round(self.order_size, 2)
         
-        if result.get("orderID"):
-            logger.info(f"✅ Order filled!")
-            self.stats.trades_successful += 1
-            self.stats.total_volume += self.order_size
-        else:
-            logger.error("Order failed")
+        logger.info(f"   📤 Placing order: {opp.direction} @ ${order_price:.2f}, size=${order_size:.2f}")
+        logger.info(f"   Token: {token_id[:20]}...")
+        
+        try:
+            order = OrderArgs(
+                token_id=token_id,
+                side=BUY,
+                size=order_size,
+                price=order_price,
+            )
+            signed = self.client.create_order(order)
+            result = self.client.post_order(signed, OrderType.FOK)
+            
+            logger.info(f"   Result: {result}")
+            
+            if result.get("orderID"):
+                logger.info(f"   ✅ Order filled! ID: {result.get('orderID')}")
+                self.stats.trades_successful += 1
+                self.stats.total_volume += self.order_size
+            else:
+                logger.error(f"   ❌ Order not filled: {result}")
+                self.stats.trades_failed += 1
+        except Exception as e:
+            logger.error(f"   ❌ Order error: {e}")
+            self.stats.trades_failed += 1
     
     def _print_status(self):
         runtime = datetime.now() - self.stats.start_time

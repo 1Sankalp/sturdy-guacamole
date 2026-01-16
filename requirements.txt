@@ -1,15 +1,15 @@
-# Polymarket Aggressive Arbitrage Bot
+# Polymarket Ultimate Arbitrage Bot
 # Install: pip install -r requirements.txt
 
-# OFFICIAL Polymarket client - REQUIRED
+# OFFICIAL Polymarket CLOB client
 py-clob-client>=0.17.0
 
-# Environment config
+# Environment configuration
 python-dotenv>=1.0.0
 
-# Beautiful terminal UI
+# Terminal UI
 rich>=13.7.0
 
-# Async support (for future WebSocket version)
-aiohttp>=3.9.0
+# Real-time data feeds
 websockets>=12.0
+requests>=2.31.0
