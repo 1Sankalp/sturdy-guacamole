@@ -200,17 +200,20 @@ class UltimateBot:
         self.api_key = os.getenv("POLYMARKET_API_KEY", "")
         self.api_secret = os.getenv("POLYMARKET_API_SECRET", "")
         self.api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+        self.proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
         
         self.order_size = float(os.getenv("ORDER_SIZE", "5"))
         self.dry_run = os.getenv("DRY_RUN", "True").lower() == "true"
         self.max_daily_loss = float(os.getenv("MAX_DAILY_LOSS", "10"))
         
-        if not all([self.private_key, self.api_key]):
-            raise ValueError("Missing credentials!")
+        if not all([self.private_key, self.api_key, self.proxy_address]):
+            raise ValueError("Missing credentials! Make sure PRIVATE_KEY, POLYMARKET_API_KEY, and POLYMARKET_PROXY_ADDRESS are set.")
         
         if not self.private_key.startswith("0x"):
             self.private_key = "0x" + self.private_key
         
+        # signature_type=2 for browser wallet (MetaMask) connected to Polymarket
+        # funder=proxy_address because funds are in the Polymarket proxy wallet
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
@@ -220,6 +223,8 @@ class UltimateBot:
                 api_secret=self.api_secret,
                 api_passphrase=self.api_passphrase,
             ),
+            signature_type=2,  # GNOSIS_SAFE for browser wallet
+            funder=self.proxy_address,  # Polymarket proxy wallet address
         )
         
         self.binance = BinanceFeed()
