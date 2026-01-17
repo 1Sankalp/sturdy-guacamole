@@ -288,10 +288,16 @@ class UltimateBot:
         ))
     
     def _fetch_markets(self):
-        """Fetch ALL active markets from Polymarket"""
+        """Fetch ALL active markets from Polymarket - only quick-resolving ones"""
         try:
+            from datetime import datetime, timezone
+            
             all_markets = []
             next_cursor = "MA=="  # Start cursor
+            
+            # Max days until resolution (7 days = quick markets)
+            MAX_DAYS_TO_RESOLUTION = 7
+            now = datetime.now(timezone.utc)
             
             # Fetch markets from CLOB API (paginated)
             for _ in range(10):  # Max 10 pages (~1000 markets)
@@ -308,8 +314,33 @@ class UltimateBot:
                     
                     for m in markets_page:
                         # Only active markets
-                        if m.get("active") and m.get("accepting_orders"):
-                            all_markets.append(m)
+                        if not (m.get("active") and m.get("accepting_orders")):
+                            continue
+                        
+                        # Check end date - only quick-resolving markets
+                        end_date_str = m.get("end_date_iso") or m.get("game_start_time")
+                        if end_date_str:
+                            try:
+                                # Parse ISO date
+                                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                                days_until = (end_date - now).days
+                                
+                                # Skip if too far in the future
+                                if days_until > MAX_DAYS_TO_RESOLUTION:
+                                    continue
+                                    
+                                # Skip if already ended
+                                if days_until < 0:
+                                    continue
+                                    
+                            except Exception:
+                                # If we can't parse date, check question for time hints
+                                q = m.get("question", "").lower()
+                                # Skip long-term markets
+                                if any(x in q for x in ["2027", "2028", "2029", "2030", "end of 2026", "december 2026"]):
+                                    continue
+                        
+                        all_markets.append(m)
                     
                     # Get next cursor
                     next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
@@ -319,7 +350,7 @@ class UltimateBot:
                 except Exception:
                     break
             
-            logger.info(f"Found {len(all_markets)} active markets")
+            logger.info(f"Found {len(all_markets)} quick-resolving markets (≤{MAX_DAYS_TO_RESOLUTION} days)")
             
             self.markets = []
             for m in all_markets:
