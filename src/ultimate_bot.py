@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-🚀 ULTIMATE POLYMARKET ARBITRAGE BOT v2
+🚀 ULTIMATE POLYMARKET BOT v3 - AGGRESSIVE MODE 🚀
 
-Combines ALL winning strategies from Twitter whales:
+Strategies:
+1. DUTCH BOOK - Buy YES + NO when total < $1 (guaranteed profit)
+2. HIGH-CONFIDENCE SNIPE - Buy outcomes at 90%+ (near-certain)
+3. VALUE BETTING - Buy underpriced outcomes
+4. MOMENTUM - Follow price movements
+5. LATENCY ARB - Beat slow market makers
 
-1. DUTCH BOOK ARBITRAGE - Buy YES + NO when total < $1
-2. LATENCY ARBITRAGE - Binance leads Polymarket by 200-500ms  
-3. 99¢ SNIPING - Buy near-certain outcomes for guaranteed profit
-4. SPORTS ARBITRAGE - Related markets that drift apart
-
-Based on strategies from: swisstony ($3.68M), easyclap ($648k), 
-Account88888 ($645k), 0x8dxd ($550k)
+Based on whales: swisstony ($3.68M), easyclap ($648k), 0x8dxd ($550k)
 """
 
 import os
 import sys
-import time
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from collections import deque
 import signal
@@ -41,7 +39,7 @@ except ImportError:
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
 console = Console()
@@ -66,7 +64,6 @@ class PricePoint:
 
 @dataclass 
 class Market:
-    """Polymarket market"""
     id: str
     condition_id: str
     question: str
@@ -75,49 +72,47 @@ class Market:
     tokens: list
     volume: float = 0
     liquidity: float = 0
+    end_date: Optional[datetime] = None
 
 
 @dataclass
 class Opportunity:
-    """Trading opportunity"""
     market: Market
     strategy: str
     direction: str
     expected_profit_pct: float
     confidence: float
     details: str
+    suggested_size: float = 1.0
 
 
 @dataclass
 class Stats:
     start_time: datetime = field(default_factory=datetime.now)
     scans: int = 0
-    dutch_book_found: int = 0
-    latency_arb_found: int = 0
-    snipe_99c_found: int = 0
+    opportunities_found: int = 0
     trades_attempted: int = 0
     trades_successful: int = 0
     trades_failed: int = 0
     total_profit: float = 0.0
     total_volume: float = 0.0
+    balance: float = 0.0
 
 
-# Track recently traded markets to avoid spam
-TRADE_COOLDOWN_SECONDS = 300  # 5 minutes between trades on same market
+# Aggressive settings
+TRADE_COOLDOWN_SECONDS = 60  # Only 1 minute cooldown
+SCAN_INTERVAL = 0.3  # Scan every 300ms
+MAX_DAYS_TO_RESOLUTION = 7  # Only quick markets
 
 
 class BinanceFeed:
-    """Real-time Binance price feed"""
+    """Real-time Binance price feed for crypto latency arb"""
     
-    BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker"
+    BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker/xrpusdt@ticker"
     
     def __init__(self):
-        self.prices: Dict[str, float] = {"BTC": 0, "ETH": 0, "SOL": 0}
-        self.price_history: Dict[str, deque] = {
-            "BTC": deque(maxlen=100),
-            "ETH": deque(maxlen=100),
-            "SOL": deque(maxlen=100),
-        }
+        self.prices: Dict[str, float] = {"BTC": 0, "ETH": 0, "SOL": 0, "XRP": 0}
+        self.price_history: Dict[str, deque] = {k: deque(maxlen=100) for k in self.prices}
         self.running = False
         self._task = None
     
@@ -126,7 +121,7 @@ class BinanceFeed:
             return
         self.running = True
         self._task = asyncio.create_task(self._run())
-        logger.info("📡 Binance feed started")
+        logger.info("📡 Binance WebSocket connected")
     
     async def stop(self):
         self.running = False
@@ -143,7 +138,7 @@ class BinanceFeed:
                         self._process(data)
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except Exception:
                 await asyncio.sleep(1)
     
     def _process(self, data: dict):
@@ -154,34 +149,26 @@ class BinanceFeed:
         price = float(ticker.get("c", 0))
         now = datetime.now()
         
-        if "BTCUSDT" in symbol:
-            self.prices["BTC"] = price
-            self.price_history["BTC"].append(PricePoint(price, now))
-        elif "ETHUSDT" in symbol:
-            self.prices["ETH"] = price
-            self.price_history["ETH"].append(PricePoint(price, now))
-        elif "SOLUSDT" in symbol:
-            self.prices["SOL"] = price
-            self.price_history["SOL"].append(PricePoint(price, now))
+        for asset in ["BTC", "ETH", "SOL", "XRP"]:
+            if f"{asset}USDT" in symbol:
+                self.prices[asset] = price
+                self.price_history[asset].append(PricePoint(price, now))
     
-    def get_price_change(self, asset: str, seconds: float = 15) -> float:
+    def get_momentum(self, asset: str, seconds: float = 30) -> float:
+        """Get price change % over last N seconds"""
         history = self.price_history.get(asset, deque())
         if len(history) < 2:
             return 0.0
         
-        now = datetime.now()
-        cutoff = now - timedelta(seconds=seconds)
+        cutoff = datetime.now() - timedelta(seconds=seconds)
+        old_prices = [p.price for p in history if p.timestamp <= cutoff]
         
-        old_price = None
-        for point in history:
-            if point.timestamp >= cutoff:
-                old_price = point.price
-                break
+        if not old_prices:
+            return 0.0
         
-        if not old_price:
-            old_price = history[0].price if history else 0
-        
+        old_price = old_prices[-1] if old_prices else history[0].price
         current = self.prices.get(asset, old_price)
+        
         if old_price == 0:
             return 0.0
         
@@ -189,11 +176,18 @@ class BinanceFeed:
 
 
 class UltimateBot:
-    """Ultimate Polymarket Arbitrage Bot"""
+    """AGGRESSIVE Polymarket Trading Bot"""
     
-    DUTCH_BOOK_THRESHOLD = 0.995  # YES + NO < 99.5¢ for arbitrage
-    SNIPE_THRESHOLD = 0.94       # 94¢ or higher for sniping (more opportunities)
-    LATENCY_THRESHOLD = 1.0      # 1.0% move for latency arb (more sensitive)
+    # Strategy thresholds - AGGRESSIVE
+    DUTCH_BOOK_THRESHOLD = 0.995   # YES + NO < 99.5¢
+    SNIPE_THRESHOLD = 0.90         # 90%+ confidence (was 94%)
+    VALUE_THRESHOLD = 0.15         # 15%+ edge on value bets
+    MOMENTUM_THRESHOLD = 0.8       # 0.8% price move
+    
+    # Risk settings
+    RISK_PER_TRADE = 0.10          # Risk 10% of balance per trade
+    MIN_ORDER_SIZE = 1.0           # Minimum $1 per trade
+    MAX_ORDER_SIZE = 20.0          # Maximum $20 per trade
     
     def __init__(self):
         self.private_key = os.getenv("PRIVATE_KEY", "")
@@ -202,18 +196,15 @@ class UltimateBot:
         self.api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "")
         self.proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS", "")
         
-        self.order_size = float(os.getenv("ORDER_SIZE", "5"))
         self.dry_run = os.getenv("DRY_RUN", "True").lower() == "true"
-        self.max_daily_loss = float(os.getenv("MAX_DAILY_LOSS", "10"))
+        self.max_daily_loss = float(os.getenv("MAX_DAILY_LOSS", "15"))
         
         if not all([self.private_key, self.api_key, self.proxy_address]):
-            raise ValueError("Missing credentials! Make sure PRIVATE_KEY, POLYMARKET_API_KEY, and POLYMARKET_PROXY_ADDRESS are set.")
+            raise ValueError("Missing credentials!")
         
         if not self.private_key.startswith("0x"):
             self.private_key = "0x" + self.private_key
         
-        # signature_type=2 for browser wallet (MetaMask) connected to Polymarket
-        # funder=proxy_address because funds are in the Polymarket proxy wallet
         self.client = ClobClient(
             host="https://clob.polymarket.com",
             chain_id=137,
@@ -223,8 +214,8 @@ class UltimateBot:
                 api_secret=self.api_secret,
                 api_passphrase=self.api_passphrase,
             ),
-            signature_type=2,  # GNOSIS_SAFE for browser wallet
-            funder=self.proxy_address,  # Polymarket proxy wallet address
+            signature_type=2,
+            funder=self.proxy_address,
         )
         
         self.binance = BinanceFeed()
@@ -232,7 +223,33 @@ class UltimateBot:
         self.stats = Stats()
         self.markets: List[Market] = []
         self.daily_loss = 0.0
-        self.recently_traded: Dict[str, datetime] = {}  # market_id -> last_trade_time
+        self.recently_traded: Dict[str, datetime] = {}
+        self.price_history: Dict[str, deque] = {}  # Track market price changes
+    
+    def _get_balance(self) -> float:
+        """Get current USDC balance from Polymarket"""
+        try:
+            # Try to get balance via API
+            # For now, we'll estimate based on what we know
+            # The real balance check would need the Polymarket balance endpoint
+            return max(15.0, self.stats.balance)  # Assume at least $15
+        except Exception:
+            return 15.0
+    
+    def _calculate_order_size(self, confidence: float) -> float:
+        """Dynamic order sizing based on balance and confidence"""
+        balance = self._get_balance()
+        
+        # Base size is RISK_PER_TRADE of balance
+        base_size = balance * self.RISK_PER_TRADE
+        
+        # Scale by confidence (higher confidence = larger bet)
+        size = base_size * confidence
+        
+        # Clamp to min/max
+        size = max(self.MIN_ORDER_SIZE, min(self.MAX_ORDER_SIZE, size))
+        
+        return round(size, 2)
     
     async def run(self):
         self.running = True
@@ -243,25 +260,26 @@ class UltimateBot:
         try:
             while self.running:
                 if self.daily_loss >= self.max_daily_loss:
-                    logger.warning("Daily loss limit reached!")
-                    await asyncio.sleep(60)
+                    logger.warning("⚠️ Daily loss limit reached! Pausing...")
+                    await asyncio.sleep(300)  # 5 min pause
                     continue
                 
-                # Fetch fresh market data
+                # Fetch markets
                 self._fetch_markets()
                 
-                # Scan for opportunities
-                opportunities = self._scan_all()
+                # Scan ALL strategies
+                opportunities = self._scan_all_strategies()
                 
-                if opportunities:
-                    best = max(opportunities, key=lambda x: x.expected_profit_pct * x.confidence)
-                    await self._execute(best)
+                # Execute ALL good opportunities (not just the best)
+                for opp in opportunities[:5]:  # Top 5 opportunities
+                    await self._execute(opp)
+                    await asyncio.sleep(0.1)  # Small delay between orders
                 
                 self.stats.scans += 1
-                if self.stats.scans % 30 == 0:
+                if self.stats.scans % 50 == 0:
                     self._print_status()
                 
-                await asyncio.sleep(0.5)  # Scan every 500ms
+                await asyncio.sleep(SCAN_INTERVAL)
                 
         except asyncio.CancelledError:
             pass
@@ -273,34 +291,31 @@ class UltimateBot:
         self.running = False
     
     def _print_startup(self):
-        mode = "🧪 DRY RUN" if self.dry_run else "🔴 LIVE"
+        mode = "🧪 DRY RUN" if self.dry_run else "🔴 LIVE TRADING"
         console.print(Panel(
-            f"[bold cyan]🚀 ULTIMATE POLYMARKET BOT v2[/bold cyan]\n\n"
+            f"[bold red]🚀 ULTIMATE BOT v3 - AGGRESSIVE MODE 🚀[/bold red]\n\n"
             f"Mode: [bold]{mode}[/bold]\n"
-            f"Order Size: ${self.order_size:.2f}\n"
-            f"Max Daily Loss: ${self.max_daily_loss:.2f}\n\n"
+            f"Risk per trade: {self.RISK_PER_TRADE*100:.0f}% of balance\n"
+            f"Max daily loss: ${self.max_daily_loss:.2f}\n\n"
             f"[green]Strategies:[/green]\n"
-            f"  ✓ Dutch Book (YES+NO < ${self.DUTCH_BOOK_THRESHOLD})\n"
-            f"  ✓ Binance Latency Arb ({self.LATENCY_THRESHOLD}% move)\n"
-            f"  ✓ 99¢ Sniping (outcomes > ${self.SNIPE_THRESHOLD})",
+            f"  ✓ Dutch Book (YES+NO < {self.DUTCH_BOOK_THRESHOLD})\n"
+            f"  ✓ Snipe ({self.SNIPE_THRESHOLD*100:.0f}%+ outcomes)\n"
+            f"  ✓ Value Betting ({self.VALUE_THRESHOLD*100:.0f}%+ edge)\n"
+            f"  ✓ Momentum Trading\n"
+            f"  ✓ Latency Arbitrage\n\n"
+            f"[yellow]Scanning every {SCAN_INTERVAL*1000:.0f}ms[/yellow]",
             title="Configuration",
-            border_style="cyan",
+            border_style="red",
         ))
     
     def _fetch_markets(self):
-        """Fetch ALL active markets from Polymarket - only quick-resolving ones"""
+        """Fetch ALL quick-resolving markets"""
         try:
-            from datetime import datetime, timezone
-            
             all_markets = []
-            next_cursor = "MA=="  # Start cursor
-            
-            # Max days until resolution (7 days = quick markets)
-            MAX_DAYS_TO_RESOLUTION = 7
+            next_cursor = "MA=="
             now = datetime.now(timezone.utc)
             
-            # Fetch markets from CLOB API (paginated)
-            for _ in range(10):  # Max 10 pages (~1000 markets)
+            for _ in range(15):  # More pages
                 try:
                     resp = requests.get(
                         f"https://clob.polymarket.com/markets?next_cursor={next_cursor}",
@@ -313,57 +328,42 @@ class UltimateBot:
                     markets_page = data if isinstance(data, list) else data.get("data", [])
                     
                     for m in markets_page:
-                        # Only active markets
                         if not (m.get("active") and m.get("accepting_orders")):
                             continue
                         
-                        # Check end date - only quick-resolving markets
+                        # Check end date
+                        end_date = None
                         end_date_str = m.get("end_date_iso") or m.get("game_start_time")
                         if end_date_str:
                             try:
-                                # Parse ISO date
                                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                                 days_until = (end_date - now).days
-                                
-                                # Skip if too far in the future
-                                if days_until > MAX_DAYS_TO_RESOLUTION:
+                                if days_until > MAX_DAYS_TO_RESOLUTION or days_until < 0:
                                     continue
-                                    
-                                # Skip if already ended
-                                if days_until < 0:
-                                    continue
-                                    
                             except Exception:
-                                # If we can't parse date, check question for time hints
                                 q = m.get("question", "").lower()
-                                # Skip long-term markets
-                                if any(x in q for x in ["2027", "2028", "2029", "2030", "end of 2026", "december 2026"]):
+                                if any(x in q for x in ["2027", "2028", "2029", "2030"]):
                                     continue
                         
-                        all_markets.append(m)
+                        all_markets.append((m, end_date))
                     
-                    # Get next cursor
                     next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
-                    if not next_cursor or next_cursor == "MA==":
+                    if not next_cursor:
                         break
                         
                 except Exception:
                     break
             
-            logger.info(f"Found {len(all_markets)} quick-resolving markets (≤{MAX_DAYS_TO_RESOLUTION} days)")
-            
             self.markets = []
-            for m in all_markets:
+            for m, end_date in all_markets:
                 try:
                     tokens = m.get("tokens", [])
                     if len(tokens) < 2:
                         continue
                     
-                    # Get prices from tokens
                     yes_price = float(tokens[0].get("price", 0.5))
                     no_price = float(tokens[1].get("price", 0.5))
                     
-                    # Skip if prices are invalid
                     if yes_price <= 0 or no_price <= 0:
                         continue
                     
@@ -376,29 +376,36 @@ class UltimateBot:
                         tokens=tokens,
                         volume=float(m.get("volume", 0) or 0),
                         liquidity=float(m.get("liquidity", 0) or 0),
+                        end_date=end_date,
                     )
                     self.markets.append(market)
                     
+                    # Track price history for momentum
+                    if market.id not in self.price_history:
+                        self.price_history[market.id] = deque(maxlen=50)
+                    self.price_history[market.id].append(
+                        PricePoint(yes_price, datetime.now())
+                    )
+                    
                 except Exception:
                     continue
+            
+            logger.info(f"Found {len(self.markets)} markets (≤{MAX_DAYS_TO_RESOLUTION} days)")
                     
         except Exception as e:
             logger.error(f"Error fetching markets: {e}")
     
     def _is_on_cooldown(self, market_id: str) -> bool:
-        """Check if we recently traded this market"""
         if market_id not in self.recently_traded:
             return False
-        
-        last_trade = self.recently_traded[market_id]
-        elapsed = (datetime.now() - last_trade).total_seconds()
+        elapsed = (datetime.now() - self.recently_traded[market_id]).total_seconds()
         return elapsed < TRADE_COOLDOWN_SECONDS
     
-    def _scan_all(self) -> List[Opportunity]:
-        """Scan all strategies"""
+    def _scan_all_strategies(self) -> List[Opportunity]:
+        """Scan ALL strategies and return sorted opportunities"""
         opportunities = []
         
-        # Clean up old cooldowns
+        # Clean old cooldowns
         now = datetime.now()
         self.recently_traded = {
             k: v for k, v in self.recently_traded.items()
@@ -406,33 +413,47 @@ class UltimateBot:
         }
         
         for market in self.markets:
-            # Skip if we recently traded this market
             if self._is_on_cooldown(market.id):
                 continue
             
-            # Strategy 1: Dutch Book (PRIORITY - guaranteed profit)
+            # Strategy 1: Dutch Book (GUARANTEED PROFIT)
             opp = self._check_dutch_book(market)
             if opp:
                 opportunities.append(opp)
-                self.stats.dutch_book_found += 1
-                continue  # Don't check other strategies for this market
+                continue
             
-            # Strategy 2: 99¢ Snipe
-            opp = self._check_99c_snipe(market)
+            # Strategy 2: High-Confidence Snipe
+            opp = self._check_snipe(market)
             if opp:
                 opportunities.append(opp)
-                self.stats.snipe_99c_found += 1
             
-            # Strategy 3: Latency Arb (for crypto markets)
+            # Strategy 3: Momentum
+            opp = self._check_momentum(market)
+            if opp:
+                opportunities.append(opp)
+            
+            # Strategy 4: Latency Arb (crypto markets)
             opp = self._check_latency_arb(market)
             if opp:
                 opportunities.append(opp)
-                self.stats.latency_arb_found += 1
+            
+            # Strategy 5: Value Betting
+            opp = self._check_value_bet(market)
+            if opp:
+                opportunities.append(opp)
+        
+        self.stats.opportunities_found += len(opportunities)
+        
+        # Sort by expected value (profit * confidence)
+        opportunities.sort(
+            key=lambda x: x.expected_profit_pct * x.confidence,
+            reverse=True
+        )
         
         return opportunities
     
     def _check_dutch_book(self, market: Market) -> Optional[Opportunity]:
-        """Check for Dutch Book arbitrage (YES + NO < $1)"""
+        """Dutch Book: YES + NO < $1 = guaranteed profit"""
         total = market.yes_price + market.no_price
         
         if total >= self.DUTCH_BOOK_THRESHOLD:
@@ -442,119 +463,194 @@ class UltimateBot:
         
         return Opportunity(
             market=market,
-            strategy="dutch_book",
+            strategy="DUTCH_BOOK",
             direction="BOTH",
             expected_profit_pct=profit_pct,
             confidence=0.99,
-            details=f"YES={market.yes_price:.3f} + NO={market.no_price:.3f} = {total:.3f}",
+            details=f"YES={market.yes_price:.3f}+NO={market.no_price:.3f}={total:.3f}",
+            suggested_size=self._calculate_order_size(0.99),
         )
     
-    def _check_99c_snipe(self, market: Market) -> Optional[Opportunity]:
-        """Check for 99¢ sniping opportunity"""
-        # Need valid tokens to trade
+    def _check_snipe(self, market: Market) -> Optional[Opportunity]:
+        """Snipe near-certain outcomes"""
         if len(market.tokens) < 2:
             return None
         
-        if market.yes_price >= self.SNIPE_THRESHOLD:
-            profit_pct = (1 - market.yes_price) * 100
-            return Opportunity(
-                market=market,
-                strategy="99c_snipe",
-                direction="YES",
-                expected_profit_pct=profit_pct,
-                confidence=market.yes_price,  # Higher price = higher confidence
-                details=f"YES at ${market.yes_price:.3f} - {profit_pct:.1f}% profit on win",
-            )
+        for direction, price in [("YES", market.yes_price), ("NO", market.no_price)]:
+            if price >= self.SNIPE_THRESHOLD:
+                profit_pct = (1 - price) * 100
+                return Opportunity(
+                    market=market,
+                    strategy="SNIPE",
+                    direction=direction,
+                    expected_profit_pct=profit_pct,
+                    confidence=price,
+                    details=f"{direction}@{price:.2f} → {profit_pct:.1f}% profit",
+                    suggested_size=self._calculate_order_size(price),
+                )
         
-        if market.no_price >= self.SNIPE_THRESHOLD:
-            profit_pct = (1 - market.no_price) * 100
+        return None
+    
+    def _check_momentum(self, market: Market) -> Optional[Opportunity]:
+        """Momentum: follow strong price movements"""
+        history = self.price_history.get(market.id, deque())
+        if len(history) < 5:
+            return None
+        
+        # Get price change over last 30 seconds
+        cutoff = datetime.now() - timedelta(seconds=30)
+        old_prices = [p.price for p in history if p.timestamp <= cutoff]
+        
+        if not old_prices:
+            return None
+        
+        old_price = old_prices[-1]
+        current_price = market.yes_price
+        change = current_price - old_price
+        
+        # Strong momentum (price moved significantly)
+        if abs(change) < self.MOMENTUM_THRESHOLD * 0.01:
+            return None
+        
+        # Follow the momentum
+        if change > 0 and current_price < 0.85:  # Going UP, not too expensive
             return Opportunity(
                 market=market,
-                strategy="99c_snipe",
+                strategy="MOMENTUM",
+                direction="YES",
+                expected_profit_pct=change * 100,
+                confidence=0.65,
+                details=f"YES trending up +{change:.2f}",
+                suggested_size=self._calculate_order_size(0.65),
+            )
+        elif change < 0 and market.no_price < 0.85:  # Going DOWN
+            return Opportunity(
+                market=market,
+                strategy="MOMENTUM",
                 direction="NO",
-                expected_profit_pct=profit_pct,
-                confidence=market.no_price,
-                details=f"NO at ${market.no_price:.3f} - {profit_pct:.1f}% profit on win",
+                expected_profit_pct=abs(change) * 100,
+                confidence=0.65,
+                details=f"NO trending (YES down {change:.2f})",
+                suggested_size=self._calculate_order_size(0.65),
             )
         
         return None
     
     def _check_latency_arb(self, market: Market) -> Optional[Opportunity]:
-        """Check for latency arbitrage on crypto markets"""
+        """Latency arb: Binance moves before Polymarket"""
         if not WEBSOCKETS_AVAILABLE:
             return None
         
         q = market.question.lower()
         
-        # Determine if this is a crypto market
         asset = None
-        if "bitcoin" in q or "btc" in q:
-            asset = "BTC"
-        elif "ethereum" in q or "eth" in q:
-            asset = "ETH"
-        elif "solana" in q or "sol" in q:
-            asset = "SOL"
+        for a in ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp"]:
+            if a in q:
+                asset = a[:3].upper()
+                if asset == "BIT":
+                    asset = "BTC"
+                elif asset == "ETH":
+                    asset = "ETH"
+                elif asset == "SOL":
+                    asset = "SOL"
+                elif asset == "XRP":
+                    asset = "XRP"
+                break
         
         if not asset:
             return None
         
-        # Get Binance price change
-        change = self.binance.get_price_change(asset, seconds=15)
+        # Get Binance momentum
+        momentum = self.binance.get_momentum(asset, seconds=30)
         
-        if abs(change) < self.LATENCY_THRESHOLD:
+        if abs(momentum) < self.MOMENTUM_THRESHOLD:
             return None
         
-        # Check if odds are stale (still near 50/50)
+        # Check if Polymarket odds are stale
         odds_diff = abs(market.yes_price - market.no_price)
-        if odds_diff > 0.2:  # Already repriced
+        if odds_diff > 0.25:  # Already repriced
             return None
         
-        # Determine direction
-        if change > 0:  # Price went UP
+        # Bet in direction of momentum
+        if momentum > 0:  # Price going UP
             direction = "YES" if "up" in q else "NO"
-            confidence = min(0.9, 0.6 + abs(change) * 0.1)
-        else:  # Price went DOWN
+        else:  # Price going DOWN
             direction = "NO" if "up" in q else "YES"
-            confidence = min(0.9, 0.6 + abs(change) * 0.1)
         
-        target_price = market.yes_price if direction == "YES" else market.no_price
-        expected_profit = (1 - target_price) * confidence * 100
+        confidence = min(0.85, 0.6 + abs(momentum) * 0.1)
         
         return Opportunity(
             market=market,
-            strategy="latency_arb",
+            strategy="LATENCY_ARB",
             direction=direction,
-            expected_profit_pct=expected_profit,
+            expected_profit_pct=abs(momentum) * 10,
             confidence=confidence,
-            details=f"Binance {asset} {change:+.2f}%, odds still {market.yes_price:.2f}/{market.no_price:.2f}",
+            details=f"Binance {asset} {momentum:+.2f}%",
+            suggested_size=self._calculate_order_size(confidence),
         )
+    
+    def _check_value_bet(self, market: Market) -> Optional[Opportunity]:
+        """Value betting: find mispriced markets"""
+        # Skip if market is too close to 50/50
+        diff = abs(market.yes_price - market.no_price)
+        if diff < 0.10:
+            return None
+        
+        # Look for markets where YES+NO significantly differs from 1
+        total = market.yes_price + market.no_price
+        edge = abs(1 - total)
+        
+        if edge < self.VALUE_THRESHOLD:
+            return None
+        
+        # If total < 1, both sides are underpriced (buy cheaper one)
+        if total < 1:
+            if market.yes_price < market.no_price:
+                return Opportunity(
+                    market=market,
+                    strategy="VALUE",
+                    direction="YES",
+                    expected_profit_pct=edge * 100,
+                    confidence=0.6,
+                    details=f"YES underpriced (total={total:.3f})",
+                    suggested_size=self._calculate_order_size(0.6),
+                )
+            else:
+                return Opportunity(
+                    market=market,
+                    strategy="VALUE",
+                    direction="NO",
+                    expected_profit_pct=edge * 100,
+                    confidence=0.6,
+                    details=f"NO underpriced (total={total:.3f})",
+                    suggested_size=self._calculate_order_size(0.6),
+                )
+        
+        return None
     
     async def _execute(self, opp: Opportunity):
         """Execute a trade"""
         self.stats.trades_attempted += 1
-        
-        # Mark this market as recently traded (cooldown)
         self.recently_traded[opp.market.id] = datetime.now()
         
-        logger.info(f"🎯 {opp.strategy.upper()}: {opp.market.question[:50]}...")
-        logger.info(f"   {opp.direction} | Confidence: {opp.confidence:.1%} | Profit: {opp.expected_profit_pct:.2f}%")
+        logger.info(f"🎯 {opp.strategy}: {opp.market.question[:50]}...")
+        logger.info(f"   {opp.direction} | Conf: {opp.confidence:.0%} | Size: ${opp.suggested_size:.2f}")
         logger.info(f"   {opp.details}")
         
         if self.dry_run:
-            logger.info(f"   [DRY RUN] Would trade ${self.order_size:.2f}")
+            logger.info(f"   [DRY RUN] Would trade ${opp.suggested_size:.2f}")
             self.stats.trades_successful += 1
-            self.stats.total_profit += self.order_size * opp.expected_profit_pct / 100
-            self.stats.total_volume += self.order_size
+            self.stats.total_profit += opp.suggested_size * opp.expected_profit_pct / 100
+            self.stats.total_volume += opp.suggested_size
             return
         
-        # LIVE TRADING
         try:
             if opp.direction == "BOTH":
                 await self._execute_dutch_book(opp)
             else:
                 await self._execute_single(opp)
         except Exception as e:
-            logger.error(f"Trade failed: {e}")
+            logger.error(f"   ❌ Trade error: {e}")
             self.stats.trades_failed += 1
             self.daily_loss += 0.1
     
@@ -562,73 +658,50 @@ class UltimateBot:
         """Execute Dutch Book - buy both sides"""
         tokens = opp.market.tokens
         if len(tokens) < 2:
-            logger.error("No tokens found!")
             return
         
         total_cost = opp.market.yes_price + opp.market.no_price
-        shares = self.order_size / total_cost
+        shares = opp.suggested_size / total_cost
         
-        yes_token = tokens[0].get("token_id", "")
-        no_token = tokens[1].get("token_id", "")
-        
-        # Buy YES
-        yes_order = OrderArgs(
-            token_id=yes_token,
-            side=BUY,
-            size=shares * opp.market.yes_price,
-            price=opp.market.yes_price + 0.01,
-        )
-        signed = self.client.create_order(yes_order)
-        result = self.client.post_order(signed, OrderType.FOK)
-        
-        if not result.get("orderID"):
-            logger.error("YES order failed")
-            return
-        
-        # Buy NO
-        no_order = OrderArgs(
-            token_id=no_token,
-            side=BUY,
-            size=shares * opp.market.no_price,
-            price=opp.market.no_price + 0.01,
-        )
-        signed = self.client.create_order(no_order)
-        result = self.client.post_order(signed, OrderType.FOK)
-        
-        if not result.get("orderID"):
-            logger.error("NO order failed - exposed!")
-            return
+        for idx, (token, price) in enumerate([(tokens[0], opp.market.yes_price), (tokens[1], opp.market.no_price)]):
+            token_id = token.get("token_id", "")
+            order_price = min(0.99, round(price + 0.01, 2))
+            order_size = round(shares * price, 2)
+            
+            order = OrderArgs(
+                token_id=token_id,
+                side=BUY,
+                size=order_size,
+                price=order_price,
+            )
+            signed = self.client.create_order(order)
+            result = self.client.post_order(signed, OrderType.GTC)  # GTC not FOK
+            
+            if not result.get("orderID"):
+                logger.error(f"   ❌ Order {idx+1} failed: {result}")
+                self.stats.trades_failed += 1
+                return
         
         profit = shares * (1 - total_cost)
-        logger.info(f"✅ Dutch Book complete! Profit: ${profit:.4f}")
-        
+        logger.info(f"   ✅ Dutch Book complete! Est. profit: ${profit:.4f}")
         self.stats.trades_successful += 1
         self.stats.total_profit += profit
-        self.stats.total_volume += self.order_size
+        self.stats.total_volume += opp.suggested_size
     
     async def _execute_single(self, opp: Opportunity):
         """Execute single-side trade"""
         tokens = opp.market.tokens
         if len(tokens) < 2:
-            logger.error("   ❌ No tokens available for this market")
             return
         
         idx = 0 if opp.direction == "YES" else 1
         token_id = tokens[idx].get("token_id", "")
-        
-        if not token_id:
-            logger.error("   ❌ Token ID not found")
-            return
-        
         price = opp.market.yes_price if opp.direction == "YES" else opp.market.no_price
         
-        # Round price to 2 decimals, size to 2 decimals (Polymarket requirement)
-        # Price must be between 0.01 and 0.99
-        order_price = min(0.99, round(price + 0.01, 2))
-        order_size = round(self.order_size, 2)
+        order_price = min(0.99, max(0.01, round(price + 0.01, 2)))
+        order_size = round(opp.suggested_size, 2)
         
-        logger.info(f"   📤 Placing order: {opp.direction} @ ${order_price:.2f}, size=${order_size:.2f}")
-        logger.info(f"   Token: {token_id[:20]}...")
+        logger.info(f"   📤 {opp.direction} @ ${order_price:.2f}, size=${order_size:.2f}")
         
         try:
             order = OrderArgs(
@@ -638,73 +711,68 @@ class UltimateBot:
                 price=order_price,
             )
             signed = self.client.create_order(order)
-            result = self.client.post_order(signed, OrderType.FOK)
-            
-            logger.info(f"   Result: {result}")
+            result = self.client.post_order(signed, OrderType.GTC)  # GTC = stays open
             
             if result.get("orderID"):
-                logger.info(f"   ✅ Order filled! ID: {result.get('orderID')}")
+                logger.info(f"   ✅ Order placed! ID: {result.get('orderID')[:20]}...")
                 self.stats.trades_successful += 1
-                self.stats.total_volume += self.order_size
+                self.stats.total_volume += opp.suggested_size
             else:
-                logger.error(f"   ❌ Order not filled: {result}")
+                logger.error(f"   ❌ Order failed: {result}")
                 self.stats.trades_failed += 1
         except Exception as e:
-            logger.error(f"   ❌ Order error: {e}")
+            logger.error(f"   ❌ Error: {e}")
             self.stats.trades_failed += 1
     
     def _print_status(self):
         runtime = datetime.now() - self.stats.start_time
         
-        table = Table(title="📊 Bot Status", show_header=False)
+        table = Table(title="📊 AGGRESSIVE BOT STATUS", show_header=False)
         table.add_column("", style="cyan")
         table.add_column("")
         
-        mode = "[red]LIVE[/red]" if not self.dry_run else "[yellow]DRY RUN[/yellow]"
+        mode = "[red]🔴 LIVE[/red]" if not self.dry_run else "[yellow]DRY RUN[/yellow]"
         
         table.add_row("Mode", mode)
         table.add_row("Runtime", str(runtime).split('.')[0])
-        table.add_row("Markets", f"{len(self.markets)}")
-        table.add_row("On Cooldown", f"{len(self.recently_traded)}")
+        table.add_row("Markets", f"[green]{len(self.markets)}[/green]")
         table.add_row("Scans", f"{self.stats.scans:,}")
-        table.add_row("Dutch Book", f"[green]{self.stats.dutch_book_found}[/green]")
-        table.add_row("99¢ Snipes", f"{self.stats.snipe_99c_found}")
-        table.add_row("Latency Arb", f"{self.stats.latency_arb_found}")
-        table.add_row("Trades OK/Fail", f"[green]{self.stats.trades_successful}[/green]/[red]{self.stats.trades_failed}[/red]")
-        table.add_row("Est. Profit", f"[green]${self.stats.total_profit:.4f}[/green]")
+        table.add_row("Opportunities", f"[cyan]{self.stats.opportunities_found}[/cyan]")
+        table.add_row("Trades", f"[green]{self.stats.trades_successful}[/green]/[red]{self.stats.trades_failed}[/red]")
         table.add_row("Volume", f"${self.stats.total_volume:.2f}")
+        table.add_row("Est. Profit", f"[green]${self.stats.total_profit:.4f}[/green]")
         table.add_row("Daily Loss", f"[red]${self.daily_loss:.2f}[/red]")
         
         if WEBSOCKETS_AVAILABLE and self.binance.prices["BTC"] > 0:
-            table.add_row("BTC", f"${self.binance.prices['BTC']:,.2f}")
-            table.add_row("ETH", f"${self.binance.prices['ETH']:,.2f}")
+            table.add_row("BTC", f"${self.binance.prices['BTC']:,.0f}")
         
         console.print(table)
     
     def _print_final(self):
         console.print(Panel(
             f"[bold]Session Complete[/bold]\n\n"
-            f"Scans: {self.stats.scans:,}\n"
-            f"Opportunities:\n"
-            f"  Dutch Book: {self.stats.dutch_book_found}\n"
-            f"  99¢ Snipes: {self.stats.snipe_99c_found}\n"
-            f"  Latency Arb: {self.stats.latency_arb_found}\n"
+            f"Runtime: {datetime.now() - self.stats.start_time}\n"
+            f"Markets Scanned: {len(self.markets)}\n"
+            f"Opportunities Found: {self.stats.opportunities_found}\n"
             f"Trades: {self.stats.trades_successful}/{self.stats.trades_attempted}\n"
+            f"Volume: ${self.stats.total_volume:.2f}\n"
             f"Est. Profit: ${self.stats.total_profit:.4f}",
-            title="📈 Final",
+            title="📈 Final Stats",
             border_style="green",
         ))
 
 
 async def main():
     console.print("""
-╔═══════════════════════════════════════════════════════════════════╗
-║   🚀  ULTIMATE POLYMARKET BOT v2  🚀                              ║
-║                                                                   ║
-║   Strategies: Dutch Book | Latency Arb | 99¢ Sniping              ║
-║   Based on: swisstony, easyclap, Account88888, 0x8dxd             ║
-╚═══════════════════════════════════════════════════════════════════╝
-    """, style="bold cyan")
+[bold red]
+╔══════════════════════════════════════════════════════════════════════╗
+║   🚀  ULTIMATE POLYMARKET BOT v3 - AGGRESSIVE MODE  🚀               ║
+║                                                                      ║
+║   Strategies: Dutch Book | Snipe | Momentum | Value | Latency        ║
+║   Risk: 10% per trade | Scan: 300ms | Markets: Quick (<7 days)       ║
+╚══════════════════════════════════════════════════════════════════════╝
+[/bold red]
+    """)
     
     bot = UltimateBot()
     signal.signal(signal.SIGINT, lambda s, f: bot.stop())
