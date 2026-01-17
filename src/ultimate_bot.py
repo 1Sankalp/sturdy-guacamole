@@ -99,10 +99,10 @@ class Stats:
     balance: float = 0.0
 
 
-# Aggressive settings
-TRADE_COOLDOWN_SECONDS = 60  # Only 1 minute cooldown
-SCAN_INTERVAL = 0.3  # Scan every 300ms
-MAX_DAYS_TO_RESOLUTION = 7  # Only quick markets
+# Settings (balanced to avoid rate limits)
+TRADE_COOLDOWN_SECONDS = 60  # 1 minute cooldown
+SCAN_INTERVAL = 3.0  # Scan every 3 seconds (avoid Cloudflare blocks)
+MAX_DAYS_TO_RESOLUTION = 30  # Include more markets
 
 
 class BinanceFeed:
@@ -303,7 +303,7 @@ class UltimateBot:
             f"  ✓ Value Betting ({self.VALUE_THRESHOLD*100:.0f}%+ edge)\n"
             f"  ✓ Momentum Trading\n"
             f"  ✓ Latency Arbitrage\n\n"
-            f"[yellow]Scanning every {SCAN_INTERVAL*1000:.0f}ms[/yellow]",
+            f"[yellow]Scanning every {SCAN_INTERVAL:.1f}s (rate-limit safe)[/yellow]",
             title="Configuration",
             border_style="red",
         ))
@@ -315,13 +315,29 @@ class UltimateBot:
             next_cursor = "MA=="
             now = datetime.now(timezone.utc)
             
-            for _ in range(20):  # More pages = more markets
+            # Headers to avoid Cloudflare blocks
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            }
+            
+            for page in range(10):  # Limit pages to avoid rate limits
                 try:
                     resp = requests.get(
                         f"https://clob.polymarket.com/markets?next_cursor={next_cursor}",
-                        timeout=10,
+                        headers=headers,
+                        timeout=15,
                     )
+                    
+                    # Handle rate limiting
+                    if resp.status_code == 403 or resp.status_code == 429:
+                        logger.warning(f"Rate limited! Waiting 30s...")
+                        import time
+                        time.sleep(30)
+                        break
+                    
                     if resp.status_code != 200:
+                        logger.warning(f"API returned {resp.status_code}")
                         break
                     
                     data = resp.json()
