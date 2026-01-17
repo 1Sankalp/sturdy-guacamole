@@ -309,13 +309,13 @@ class UltimateBot:
         ))
     
     def _fetch_markets(self):
-        """Fetch ALL quick-resolving markets"""
+        """Fetch ALL active markets from Polymarket"""
         try:
             all_markets = []
             next_cursor = "MA=="
             now = datetime.now(timezone.utc)
             
-            for _ in range(15):  # More pages
+            for _ in range(20):  # More pages = more markets
                 try:
                     resp = requests.get(
                         f"https://clob.polymarket.com/markets?next_cursor={next_cursor}",
@@ -328,22 +328,27 @@ class UltimateBot:
                     markets_page = data if isinstance(data, list) else data.get("data", [])
                     
                     for m in markets_page:
+                        # Only active markets accepting orders
                         if not (m.get("active") and m.get("accepting_orders")):
                             continue
                         
-                        # Check end date
+                        # Check question for obvious long-term markets
+                        q = m.get("question", "").lower()
+                        if any(x in q for x in ["2027", "2028", "2029", "2030", "end of 2026"]):
+                            continue
+                        
+                        # Try to parse end date but DON'T exclude if missing
                         end_date = None
                         end_date_str = m.get("end_date_iso") or m.get("game_start_time")
                         if end_date_str:
                             try:
                                 end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                                 days_until = (end_date - now).days
-                                if days_until > MAX_DAYS_TO_RESOLUTION or days_until < 0:
+                                # Only skip if we KNOW it's too far
+                                if days_until > 30:  # Relaxed to 30 days
                                     continue
                             except Exception:
-                                q = m.get("question", "").lower()
-                                if any(x in q for x in ["2027", "2028", "2029", "2030"]):
-                                    continue
+                                pass  # Include if we can't parse
                         
                         all_markets.append((m, end_date))
                     
@@ -351,7 +356,8 @@ class UltimateBot:
                     if not next_cursor:
                         break
                         
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Page fetch error: {e}")
                     break
             
             self.markets = []
@@ -390,7 +396,7 @@ class UltimateBot:
                 except Exception:
                     continue
             
-            logger.info(f"Found {len(self.markets)} markets (≤{MAX_DAYS_TO_RESOLUTION} days)")
+            logger.info(f"Found {len(self.markets)} active markets")
                     
         except Exception as e:
             logger.error(f"Error fetching markets: {e}")
