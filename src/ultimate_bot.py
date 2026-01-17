@@ -192,8 +192,8 @@ class UltimateBot:
     """Ultimate Polymarket Arbitrage Bot"""
     
     DUTCH_BOOK_THRESHOLD = 0.995  # YES + NO < 99.5¢ for arbitrage
-    SNIPE_THRESHOLD = 0.96       # 96¢ or higher for sniping
-    LATENCY_THRESHOLD = 1.5      # 1.5% move for latency arb
+    SNIPE_THRESHOLD = 0.94       # 94¢ or higher for sniping (more opportunities)
+    LATENCY_THRESHOLD = 1.0      # 1.0% move for latency arb (more sensitive)
     
     def __init__(self):
         self.private_key = os.getenv("PRIVATE_KEY", "")
@@ -288,89 +288,63 @@ class UltimateBot:
         ))
     
     def _fetch_markets(self):
-        """Fetch 15-minute crypto up/down markets using timestamp-based slugs"""
+        """Fetch ALL active markets from Polymarket"""
         try:
-            import time
-            from datetime import datetime, timezone
+            all_markets = []
+            next_cursor = "MA=="  # Start cursor
             
-            # Get current timestamp and calculate 15-minute windows
-            now = datetime.now(timezone.utc)
-            base_ts = int(now.timestamp())
-            window_15min = 15 * 60
-            current_window = (base_ts // window_15min) * window_15min
+            # Fetch markets from CLOB API (paginated)
+            for _ in range(10):  # Max 10 pages (~1000 markets)
+                try:
+                    resp = requests.get(
+                        f"https://clob.polymarket.com/markets?next_cursor={next_cursor}",
+                        timeout=10,
+                    )
+                    if resp.status_code != 200:
+                        break
+                    
+                    data = resp.json()
+                    markets_page = data if isinstance(data, list) else data.get("data", [])
+                    
+                    for m in markets_page:
+                        # Only active markets
+                        if m.get("active") and m.get("accepting_orders"):
+                            all_markets.append(m)
+                    
+                    # Get next cursor
+                    next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
+                    if not next_cursor or next_cursor == "MA==":
+                        break
+                        
+                except Exception:
+                    break
             
-            # Supported cryptocurrencies
-            cryptos = ["btc", "eth", "sol", "xrp"]
-            gamma_markets = []
-            
-            # Check current and next few windows (0, +1, +2, +3)
-            for offset in range(0, 4):
-                ts = current_window + (offset * window_15min)
-                
-                for crypto in cryptos:
-                    slug = f"{crypto}-updown-15m-{ts}"
-                    try:
-                        resp = requests.get(
-                            f"https://gamma-api.polymarket.com/events?slug={slug}",
-                            timeout=5,
-                        )
-                        if resp.status_code == 200:
-                            events = resp.json()
-                            for event in events:
-                                markets = event.get("markets", [])
-                                for m in markets:
-                                    if m.get("acceptingOrders") and not m.get("closed"):
-                                        gamma_markets.append(m)
-                    except Exception:
-                        continue
-            
-            logger.info(f"Found {len(gamma_markets)} 15-min crypto markets")
+            logger.info(f"Found {len(all_markets)} active markets")
             
             self.markets = []
-            for m in gamma_markets:
+            for m in all_markets:
                 try:
-                    # Get prices from market data
-                    prices = json.loads(m.get("outcomePrices", '["0.5", "0.5"]'))
-                    if len(prices) < 2:
-                        continue
-                    
-                    condition_id = m.get("conditionId", "")
-                    if not condition_id:
-                        continue
-                    
-                    # Get token IDs from clobTokenIds (for 15-min markets)
-                    clob_token_ids = json.loads(m.get("clobTokenIds", "[]"))
-                    if len(clob_token_ids) < 2:
-                        # Try CLOB API fallback
-                        clob_resp = requests.get(
-                            f"https://clob.polymarket.com/markets/{condition_id}",
-                            timeout=5,
-                        )
-                        if clob_resp.status_code == 200:
-                            clob_data = clob_resp.json()
-                            tokens = clob_data.get("tokens", [])
-                        else:
-                            continue
-                    else:
-                        # Build tokens from clobTokenIds
-                        outcomes = json.loads(m.get("outcomes", '["Up", "Down"]'))
-                        tokens = [
-                            {"token_id": clob_token_ids[0], "outcome": outcomes[0], "price": float(prices[0])},
-                            {"token_id": clob_token_ids[1], "outcome": outcomes[1], "price": float(prices[1])},
-                        ]
-                    
+                    tokens = m.get("tokens", [])
                     if len(tokens) < 2:
                         continue
                     
+                    # Get prices from tokens
+                    yes_price = float(tokens[0].get("price", 0.5))
+                    no_price = float(tokens[1].get("price", 0.5))
+                    
+                    # Skip if prices are invalid
+                    if yes_price <= 0 or no_price <= 0:
+                        continue
+                    
                     market = Market(
-                        id=m.get("id", condition_id),
-                        condition_id=condition_id,
+                        id=m.get("condition_id", ""),
+                        condition_id=m.get("condition_id", ""),
                         question=m.get("question", ""),
-                        yes_price=float(prices[0]),
-                        no_price=float(prices[1]),
+                        yes_price=yes_price,
+                        no_price=no_price,
                         tokens=tokens,
-                        volume=float(m.get("volumeNum", 0)),
-                        liquidity=float(m.get("liquidityNum", 0)),
+                        volume=float(m.get("volume", 0) or 0),
+                        liquidity=float(m.get("liquidity", 0) or 0),
                     )
                     self.markets.append(market)
                     
