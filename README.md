@@ -107,7 +107,18 @@ Five cron windows; the bot picks **2–5** of them each day:
 | 4    | 15:55 | 21:25   |
 | 5    | 20:10 | 01:40+1 |
 
-Manual run: Actions → **Daily Maintenance Report** → enable **Force a commit**.
+Manual run: Actions → **Daily Maintenance Report** → **Run workflow**.
+
+### Make commits show on your profile graph
+
+Commits from `github-actions[bot]` do **not** count on your contribution chart.
+Add a repo secret once:
+
+1. GitHub → **Settings → Developer settings → Personal access tokens** → create a classic token with `repo` scope.
+2. Repo → **Settings → Secrets and variables → Actions** → **New repository secret**
+3. Name: `GH_PAT`, value: your token.
+
+After that, commits appear under your account on the graph (may take a few minutes).
 
 ## ⚠️ Important
 

@@ -25,6 +25,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
+          # GH_PAT makes commits count on your profile graph (see README).
+          token: ${{ secrets.GH_PAT || github.token }}
           persist-credentials: true
 
       - name: Setup Python
@@ -34,8 +36,8 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "1Sankalp"
+          git config user.email "76829274+1Sankalp@users.noreply.github.com"
 
       - name: Run activity bot
         env:
