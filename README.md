@@ -87,6 +87,37 @@ python -m src.ultimate_bot
 # Press Ctrl+B, then D to detach
 ```
 
+## Daily GitHub Activity (Meaningful Automation)
+
+This repo includes a scheduled GitHub Action that creates a daily maintenance
+report at `reports/daily-health/YYYY-MM-DD.md`.
+
+### What it records
+
+- generation timestamp (UTC)
+- current branch
+- latest commit hash before report generation
+- total commit count
+- number of Python files in `src/`
+- `requirements.txt` SHA256 fingerprint
+
+### Enable it
+
+1. Push this repository with the new workflow files.
+2. Open GitHub → **Actions** tab → enable workflows if prompted.
+3. Run **Daily Maintenance Report** once using **Run workflow** (manual trigger).
+4. The scheduler will run daily after that.
+
+You can edit `.github/workflows/daily-maintenance.yml` to change run time:
+
+```yaml
+on:
+  schedule:
+    - cron: "40 3 * * *"
+```
+
+Cron uses UTC.
+
 ## ⚠️ Important
 
 - **Start with DRY_RUN=True** to test without risking money

@@ -1,0 +1,37 @@
+name: Daily Maintenance Report
+
+on:
+  schedule:
+    # 03:40 UTC daily (~9:10 AM IST)
+    - cron: "40 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate daily health report
+        run: python scripts/daily_maintenance_report.py
+
+      - name: Commit and push if report changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/daily-health/*.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: add daily repository health report"
+          git push
