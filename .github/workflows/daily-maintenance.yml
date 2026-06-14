@@ -2,9 +2,18 @@ name: Daily Maintenance Report
 
 on:
   schedule:
-    # 03:40 UTC daily (~9:10 AM IST)
-    - cron: "40 3 * * *"
+    # Five windows spread across UTC day; 2–5 run per day (see activity_bot.py).
+    - cron: "15 3 * * *"
+    - cron: "40 7 * * *"
+    - cron: "20 11 * * *"
+    - cron: "55 15 * * *"
+    - cron: "10 20 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force a commit (ignore daily slot selection)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,17 +30,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Generate daily health report
-        run: python scripts/daily_maintenance_report.py
-
-      - name: Commit and push if report changed
+      - name: Run activity bot
+        env:
+          GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add reports/daily-health/*.md
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            ARGS="--force"
+          elif [ -n "${{ github.event.schedule }}" ]; then
+            ARGS="--cron '${{ github.event.schedule }}'"
           fi
-          git commit -m "chore: add daily repository health report"
-          git push
+          python scripts/activity_bot.py $ARGS

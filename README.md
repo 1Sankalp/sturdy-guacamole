@@ -87,36 +87,27 @@ python -m src.ultimate_bot
 # Press Ctrl+B, then D to detach
 ```
 
-## Daily GitHub Activity (Meaningful Automation)
+## Daily GitHub Activity (Automated)
 
-This repo includes a scheduled GitHub Action that creates a daily maintenance
-report at `reports/daily-health/YYYY-MM-DD.md`.
+A scheduled GitHub Action runs **2–5 times per day** (varies by date) and
+commits unique snapshots under `reports/activity/`.
 
-### What it records
+Each run records repo metrics (branch, HEAD, commit count, Python file/line
+counts, dependency fingerprint) with a timestamp so every commit is distinct.
 
-- generation timestamp (UTC)
-- current branch
-- latest commit hash before report generation
-- total commit count
-- number of Python files in `src/`
-- `requirements.txt` SHA256 fingerprint
+### Schedule (UTC)
 
-### Enable it
+Five cron windows; the bot picks **2–5** of them each day:
 
-1. Push this repository with the new workflow files.
-2. Open GitHub → **Actions** tab → enable workflows if prompted.
-3. Run **Daily Maintenance Report** once using **Run workflow** (manual trigger).
-4. The scheduler will run daily after that.
+| Slot | UTC   | ~IST    |
+|------|-------|---------|
+| 1    | 03:15 | 08:45   |
+| 2    | 07:40 | 13:10   |
+| 3    | 11:20 | 16:50   |
+| 4    | 15:55 | 21:25   |
+| 5    | 20:10 | 01:40+1 |
 
-You can edit `.github/workflows/daily-maintenance.yml` to change run time:
-
-```yaml
-on:
-  schedule:
-    - cron: "40 3 * * *"
-```
-
-Cron uses UTC.
+Manual run: Actions → **Daily Maintenance Report** → enable **Force a commit**.
 
 ## ⚠️ Important
 
