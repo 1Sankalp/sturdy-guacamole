@@ -39,6 +39,24 @@ REPORT_TYPES = [
     "maintenance-log",
 ]
 
+COMMIT_MESSAGES = [
+    "fix: slow scan cadence to reduce rate limits",
+    "chore: pin py-clob-client dependency",
+    "refactor: tighten market date filter window",
+    "fix: improve request headers for Cloudflare",
+    "chore: update dry-run defaults in env example",
+    "fix: adjust dutch book threshold margin",
+    "chore: bump order size safety cap",
+    "fix: handle empty orderbook responses",
+    "refactor: consolidate latency arb config",
+    "chore: sync requirements lockfile",
+]
+
+
+def pick_commit_message(slot: int, when: dt.datetime) -> str:
+    idx = (day_seed(when.date()) + slot * 31 + when.hour) % len(COMMIT_MESSAGES)
+    return COMMIT_MESSAGES[idx]
+
 
 def run_git(command: list[str]) -> str:
     result = subprocess.run(
@@ -143,17 +161,6 @@ def append_activity_log(when: dt.datetime, report_type: str, rel_path: str) -> N
         f.write(line)
 
 
-def commit_messages(report_type: str) -> str:
-    messages = {
-        "health-snapshot": "chore: add health snapshot",
-        "dependency-fingerprint": "chore: refresh dependency fingerprint",
-        "source-stats": "chore: update source stats",
-        "repo-pulse": "chore: record repo pulse",
-        "maintenance-log": "chore: append maintenance activity log",
-    }
-    return messages.get(report_type, "chore: automated maintenance update")
-
-
 def write_and_commit(slot: int, when: dt.datetime) -> None:
     ACTIVITY_DIR.mkdir(parents=True, exist_ok=True)
     metrics = gather_metrics()
@@ -170,7 +177,7 @@ def write_and_commit(slot: int, when: dt.datetime) -> None:
         print("Nothing to commit.")
         return
 
-    run_git(["git", "commit", "-m", commit_messages(report_type)])
+    run_git(["git", "commit", "-m", pick_commit_message(slot, when)])
     run_git(["git", "push"])
     print(f"Committed and pushed {rel}")
 
