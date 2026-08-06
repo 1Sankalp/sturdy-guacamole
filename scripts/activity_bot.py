@@ -161,6 +161,13 @@ def append_activity_log(when: dt.datetime, report_type: str, rel_path: str) -> N
         f.write(line)
 
 
+def commits_today(when: dt.datetime) -> int:
+    date_prefix = when.strftime("%Y-%m-%d")
+    if not ACTIVITY_DIR.exists():
+        return 0
+    return len(list(ACTIVITY_DIR.glob(f"{date_prefix}-*.md")))
+
+
 def write_and_commit(slot: int, when: dt.datetime) -> None:
     ACTIVITY_DIR.mkdir(parents=True, exist_ok=True)
     metrics = gather_metrics()
@@ -193,11 +200,28 @@ def main() -> None:
         action="store_true",
         help="Run regardless of slot schedule (manual trigger)",
     )
+    parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        help="Commit only if today's activity is below the daily minimum",
+    )
     args = parser.parse_args()
 
     cron = args.cron or os.environ.get("GITHUB_EVENT_SCHEDULE", "")
     now = dt.datetime.now(dt.UTC)
     today = now.date()
+
+    if args.catch_up:
+        planned = commits_planned_for(today)
+        done = commits_today(now)
+        if done >= planned:
+            print(f"Catch-up: already {done}/{planned} commit(s) today.")
+            sys.exit(0)
+        needed = planned - done
+        print(f"Catch-up: making {needed} commit(s) ({done}/{planned} so far).")
+        for i in range(needed):
+            write_and_commit((now.hour + i) % len(SLOTS), now)
+        return
 
     if args.force:
         slot = now.hour % len(SLOTS)

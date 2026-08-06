@@ -2,12 +2,12 @@ name: Daily Maintenance Report
 
 on:
   schedule:
-    # Five windows spread across UTC day; 2–5 run per day (see activity_bot.py).
     - cron: "15 3 * * *"
     - cron: "40 7 * * *"
     - cron: "20 11 * * *"
     - cron: "55 15 * * *"
     - cron: "10 20 * * *"
+    - cron: "0 19 * * *"  # catch-up if afternoon slots were missed
   workflow_dispatch:
     inputs:
       force:
@@ -15,17 +15,21 @@ on:
         type: boolean
         default: true
 
+concurrency:
+  group: daily-maintenance
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   daily-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          # GH_PAT makes commits count on your profile graph (see README).
           token: ${{ secrets.GH_PAT || github.token }}
           persist-credentials: true
 
@@ -43,7 +47,9 @@ jobs:
         env:
           GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ inputs.force }}" = "true" ]; then
+          if [ "${{ github.event.schedule }}" = "0 19 * * *" ]; then
+            python scripts/activity_bot.py --catch-up
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ inputs.force }}" = "true" ]; then
             python scripts/activity_bot.py --force
           else
             python scripts/activity_bot.py
